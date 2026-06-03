@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
     libgles2 \
     libxext6 \
     libsm6 \
+    libegl1 \
+    libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
