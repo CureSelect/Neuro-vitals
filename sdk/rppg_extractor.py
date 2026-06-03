@@ -29,15 +29,22 @@ class RPPGExtractor:
         arr = np.stack([cv2_mean_rgb(a) for a in roi_buffer], axis=0)
         return arr
 
-    def extract(self, roi_buffer: List[np.ndarray]) -> np.ndarray:
+    def extract(self, roi_buffer: List[np.ndarray], rgb_means: np.ndarray = None) -> np.ndarray:
         """
         Extract the raw rPPG signal (CHROM) and apply Wavelet Denoising.
+        Accepts either a list of cropped BGR frames (roi_buffer) OR pre-computed rgb_means directly.
         """
         try:
-            if len(roi_buffer) < 10:
+            if rgb_means is not None:
+                arr = rgb_means
+            else:
+                if len(roi_buffer) < 10:
+                    return np.array([])
+                arr = self._rgb_means(roi_buffer)
+
+            if len(arr) < 10:
                 return np.array([])
 
-            arr = self._rgb_means(roi_buffer)
             r = arr[:, 2]
             g = arr[:, 1]
             b = arr[:, 0]

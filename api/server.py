@@ -35,10 +35,10 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from sdk.face_processor import FaceProcessor, extract_frames_from_video
-from sdk.rppg_extractor import RPPGExtractor
 from sdk.feature_engineer import (
     extract_all_features, detect_peaks, compute_sqi,
 )
+from sdk.rppg_extractor import RPPGExtractor, cv2_mean_rgb
 from sdk.anomaly_model import WaveformValidator
 from sdk.bayesian_engine import (
     BayesianMentalHealthEngine, MoodInferenceEngine
@@ -214,7 +214,8 @@ def analyze_video(
         
         import cv2
         cap = cv2.VideoCapture(video_path)
-        roi_buffer = []
+        rgb_means_buffer = []
+        best_roi = None
         landmarks_buffer = []
         demo_samples = []
         max_frames = 300
@@ -240,7 +241,7 @@ def analyze_video(
                     frame = cv2.resize(frame, (1280, int(h * scale)))
 
                 if frame_idx % 20 == 0:
-                    trace_log(f"[NeuroVitals] [STEP 2] ROI Frame {frame_idx}... Buffer size: {len(roi_buffer)}")
+                    trace_log(f"[NeuroVitals] [STEP 2] ROI Frame {frame_idx}... Buffer size: {len(rgb_means_buffer)}")
 
                 # --- 1.5 Automated Demographic Estimation (Consensus Voting) ---
                 if gender.lower() == "auto" and frame_idx % sample_interval == 0 and len(demo_samples) < 5:
@@ -256,8 +257,12 @@ def analyze_video(
                     trace_log(f"[NeuroVitals] [STEP 2] SDK Error at frame {frame_idx}: {sdk_e}")
                 
                 if res_roi is not None:
-                    roi_buffer.append(res_roi)
+                    # Immediately convert to RGB mean floats so we don't hold the huge image in RAM!
+                    rgb_means_buffer.append(cv2_mean_rgb(res_roi))
                     landmarks_buffer.append(res_lm)
+                    # Keep just ONE good quality face crop (around the middle of the video) for Identity Verification
+                    if best_roi is None or len(rgb_means_buffer) == max_frames // 2:
+                        best_roi = res_roi.copy()
                 
                 # Manual memory check/hint
                 if frame_idx % 50 == 0:
@@ -276,7 +281,7 @@ def analyze_video(
         import gc
         gc.collect()
 
-        trace_log(f"[NeuroVitals] [STEP 1 & 2] Processing complete. Valid faces: {len(roi_buffer)}")
+        trace_log(f"[NeuroVitals] [STEP 1 & 2] Processing complete. Valid faces: {len(rgb_means_buffer)}")
 
         # Process demographics consensus if requested
         if gender.lower() == "auto":
@@ -294,14 +299,14 @@ def analyze_video(
                 trace_log("[NeuroVitals] [STEP 1.5] Demographic estimation failed, using defaults.")
                 gender = "other"
 
-        if len(roi_buffer) < 2:  # Reduced from 10 to 2 for extreme resiliency
-            trace_log(f"[NeuroVitals] [STEP 2] WARNING: Only {len(roi_buffer)} faces found. Proceeding with limited data.")
-            if len(roi_buffer) == 0:
+        if len(rgb_means_buffer) < 2:  # Reduced from 10 to 2 for extreme resiliency
+            trace_log(f"[NeuroVitals] [STEP 2] WARNING: Only {len(rgb_means_buffer)} faces found. Proceeding with limited data.")
+            if len(rgb_means_buffer) == 0:
                 raise HTTPException(status_code=400, detail="No face detected in video stream")
 
         # --- 3. rPPG signal extraction (CHROM) ---
         trace_log("[NeuroVitals] [STEP 3] Running CHROM signal extraction...")
-        extraction_res = _rppg_extractor.extract(roi_buffer)
+        extraction_res = _rppg_extractor.extract([], rgb_means=np.array(rgb_means_buffer))
         
         if isinstance(extraction_res, dict):
             signal = extraction_res.get("pulse_signal", np.array([]))
@@ -350,8 +355,7 @@ def analyze_video(
         trace_log(f"[NeuroVitals] [STEP 6] Blink-based Liveness: {liveness_score:.2f}")
 
         # Verification (Face Embedding)
-        # In a real system, we'd pass the best ROI to the embedder
-        best_roi = roi_buffer[len(roi_buffer)//2] if roi_buffer else None
+        # We pass the best ROI we kept during the stream to the embedder
         embedding_model = EmbeddingModel()
         embedding = embedding_model.embed(best_roi)
         # Placeholder verification against self
