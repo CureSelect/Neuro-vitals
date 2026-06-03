@@ -209,78 +209,90 @@ def analyze_video(
             trace_log(f"[NeuroVitals] ERROR writing temp file: {e}")
             raise HTTPException(status_code=500, detail="Failed to store uploaded video")
 
-        # --- 1. Frame extraction ---
-        trace_log("[NeuroVitals] [STEP 1] Starting frame extraction...")
-        frames = extract_frames_from_video(video_path, max_frames=450)
-        trace_log(f"[NeuroVitals] [STEP 1] Extracted {len(frames)} frames total.")
+        # --- 1 & 2. Streaming Frame and ROI extraction ---
+        trace_log("[NeuroVitals] [STEP 1 & 2] Starting streaming frame extraction to prevent OOM...")
         
-        if not frames:
-            trace_log("[NeuroVitals] [STEP 1] FATAL ERROR: extract_frames_from_video returned 0 frames.")
-            raise HTTPException(status_code=400, detail="No frames found in video")
-
-        # --- 1.5 Automated Demographic Estimation (Consensus Voting) ---
-        if gender.lower() == "auto":
-            trace_log("[NeuroVitals] [STEP 1.5] Attempting temporal demographic consensus...")
-            # Sample 5 frames across the video for better accuracy
-            sample_indices = np.linspace(0, len(frames)-1, 5, dtype=int)
-            samples = []
-            
-            for idx in sample_indices:
-                res = _face_processor.estimate_demographics(frames[idx])
-                if res:
-                    samples.append(res)
-            
-            if samples:
-                # Majority vote for gender
-                genders = [s["gender"] for s in samples]
-                gender = max(set(genders), key=genders.count)
-                
-                # Median for age to reject outliers
-                ages = [s["age"] for s in samples]
-                age = int(np.median(ages))
-                
-                trace_log(f"[NeuroVitals] [STEP 1.5] Consensus Results -> Gender: {gender}, Age: {age} (from {len(samples)} samples)")
-            else:
-                trace_log("[NeuroVitals] [STEP 1.5] Demographic estimation failed, using defaults.")
-                gender = "other"
-                # Keep original age Form default if possible, or use 35
-
-
-        # --- 2. Face ROI extraction & Landmark Collection ---
-        trace_log("[NeuroVitals] [STEP 2] Initializing ROI extraction...")
+        import cv2
+        cap = cv2.VideoCapture(video_path)
         roi_buffer = []
-        landmarks_buffer = []  # For liveness tracking
+        landmarks_buffer = []
+        demo_samples = []
+        max_frames = 300
+        frame_idx = 0
         
-        # We'll try to limit to 300 frames if it's too large, or just keep going
-        frames_to_process = frames[:300] if len(frames) > 300 else frames
-        trace_log(f"[NeuroVitals] [STEP 2] Processing {len(frames_to_process)} frames for ROI...")
+        # Determine total frames if possible to spread out demographic sampling
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = max_frames
+        sample_interval = max(1, min(total_frames, max_frames) // 5)
 
         try:
-            for i, frame in enumerate(frames_to_process):
-                if i % 20 == 0:
-                    trace_log(f"[NeuroVitals] [STEP 2] ROI Frame {i}/{len(frames_to_process)}... Buffer size: {len(roi_buffer)}")
+            while cap.isOpened() and frame_idx < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Downscale frame slightly if it's huge (e.g. 1080p -> 720p) to save memory during inference
+                # Not strictly necessary since we free it right after, but helps Mediapipe/InsightFace peak memory
+                h, w = frame.shape[:2]
+                if w > 1280:
+                    scale = 1280 / w
+                    frame = cv2.resize(frame, (1280, int(h * scale)))
 
-                # Use a very specific try-except here
+                if frame_idx % 20 == 0:
+                    trace_log(f"[NeuroVitals] [STEP 2] ROI Frame {frame_idx}... Buffer size: {len(roi_buffer)}")
+
+                # --- 1.5 Automated Demographic Estimation (Consensus Voting) ---
+                if gender.lower() == "auto" and frame_idx % sample_interval == 0 and len(demo_samples) < 5:
+                    res = _face_processor.estimate_demographics(frame)
+                    if res:
+                        demo_samples.append(res)
+
+                # --- 2. Face ROI extraction & Landmark Collection ---
                 res_roi, res_lm = None, None
                 try:
                     res_roi, res_lm = _face_processor.extract_roi_with_landmarks(frame)
                 except Exception as sdk_e:
-                    trace_log(f"[NeuroVitals] [STEP 2] SDK Error at frame {i}: {sdk_e}")
+                    trace_log(f"[NeuroVitals] [STEP 2] SDK Error at frame {frame_idx}: {sdk_e}")
                 
                 if res_roi is not None:
                     roi_buffer.append(res_roi)
                     landmarks_buffer.append(res_lm)
                 
                 # Manual memory check/hint
-                if i % 100 == 0:
+                if frame_idx % 50 == 0:
                     import gc
                     gc.collect()
-
-            trace_log(f"[NeuroVitals] [STEP 2] ROI extraction complete. Valid faces: {len(roi_buffer)}")
+                    
+                frame_idx += 1
+                
         except Exception as loop_e:
             trace_log(f"[NeuroVitals] [STEP 2] FATAL LOOP ERROR: {loop_e}")
             trace_log(traceback.format_exc())
+            cap.release()
             raise HTTPException(status_code=500, detail="ROI pipeline failure")
+            
+        cap.release()
+        import gc
+        gc.collect()
+
+        trace_log(f"[NeuroVitals] [STEP 1 & 2] Processing complete. Valid faces: {len(roi_buffer)}")
+
+        # Process demographics consensus if requested
+        if gender.lower() == "auto":
+            if demo_samples:
+                # Majority vote for gender
+                genders = [s["gender"] for s in demo_samples]
+                gender = max(set(genders), key=genders.count)
+                
+                # Median for age to reject outliers
+                ages = [s["age"] for s in demo_samples]
+                age = int(np.median(ages))
+                
+                trace_log(f"[NeuroVitals] [STEP 1.5] Consensus Results -> Gender: {gender}, Age: {age} (from {len(demo_samples)} samples)")
+            else:
+                trace_log("[NeuroVitals] [STEP 1.5] Demographic estimation failed, using defaults.")
+                gender = "other"
 
         if len(roi_buffer) < 2:  # Reduced from 10 to 2 for extreme resiliency
             trace_log(f"[NeuroVitals] [STEP 2] WARNING: Only {len(roi_buffer)} faces found. Proceeding with limited data.")

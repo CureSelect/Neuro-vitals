@@ -2,7 +2,7 @@ services:
   - type: web
     name: neurovitals-api
     runtime: docker
-    plan: starter # ML models require more than the 512MB free tier
+    plan: standard # ML models require more than the 512MB free/starter tier
     region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
