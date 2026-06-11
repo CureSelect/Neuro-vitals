@@ -109,7 +109,13 @@ class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=413, content={"detail": f"Payload too large – limit is {MAX_CONTENT_LENGTH} bytes"})
         return await call_next(request)
 
-app.add_middleware(LimitUploadSizeMiddleware)
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
