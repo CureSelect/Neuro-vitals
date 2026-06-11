@@ -13,6 +13,12 @@ GET  /governance/report  Governance / drift / bias monitoring report
 """
 
 import os
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# Configurable limits via environment variables (defaults provided)
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "150"))  # Number of video frames to process
+MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", "52428800"))  # 50 MB default upload limit
+
 import sys
 
 # MONKEYPATCH: Prevent mediapipe -> sounddevice -> PortAudio initialization which hangs on some Windows systems
@@ -96,13 +102,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_CONTENT_LENGTH:
+            return JSONResponse(status_code=413, content={"detail": f"Payload too large – limit is {MAX_CONTENT_LENGTH} bytes"})
+        return await call_next(request)
+
+app.add_middleware(LimitUploadSizeMiddleware)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -185,6 +192,38 @@ def analyze_video(
     age: int = Form(35),
     gender: str = Form("other")
 ):
+    """Start a new analysis scan.
+
+    - Truncate the runtime trace log to keep it fresh.
+    - Delete any stray temporary video files left over from previous crashes.
+    """
+    # ---- Cleanup old runtime artifacts ----
+    # Reset the trace log (if it exists)
+    try:
+        with open(TRACE_LOG, "w", encoding="utf-8") as f:
+            f.truncate(0)
+    except Exception as e:
+        trace_log(f"[NeuroVitals] [CLEANUP] Failed to truncate trace log: {e}")
+    # Remove any other .log files in the logs folder to start fresh
+    logs_dir = os.path.dirname(TRACE_LOG)
+    for lf in os.listdir(logs_dir):
+        log_path = os.path.join(logs_dir, lf)
+        if lf != os.path.basename(TRACE_LOG) and lf.lower().endswith('.log'):
+            try:
+                os.remove(log_path)
+                trace_log(f"[NeuroVitals] [CLEANUP] Deleted old log file {lf}")
+            except Exception as e:
+                trace_log(f"[NeuroVitals] [CLEANUP] Failed to delete log file {lf}: {e}")
+    # Remove leftover .webm temp files from the system temp directory
+    temp_dir = tempfile.gettempdir()
+    for fname in os.listdir(temp_dir):
+        if fname.lower().endswith('.webm'):
+            try:
+                os.remove(os.path.join(temp_dir, fname))
+            except Exception as e:
+                trace_log(f"[NeuroVitals] [CLEANUP] Failed to delete temp file {fname}: {e}")
+    # Continue with the normal request handling below
+
     """Accept a short video, run the full rPPG → Bayesian → SHAP pipeline.
     
     Using 'def' instead of 'async def' to offload this CPU-bound work
@@ -218,7 +257,7 @@ def analyze_video(
         best_roi = None
         landmarks_buffer = []
         demo_samples = []
-        max_frames = 300
+        max_frames = MAX_FRAMES  # Use configurable limit
         frame_idx = 0
         
         # Determine total frames if possible to spread out demographic sampling
@@ -432,6 +471,13 @@ def analyze_video(
             "sqi": response.SignalQualityIndex,
         })
 
+                # Explicit cleanup of large in‑memory objects to free RAM before returning
+        del signal
+        del rgb_means_buffer
+        del landmarks_buffer
+        del features
+        import gc
+        gc.collect()
         return response
 
     except HTTPException:
