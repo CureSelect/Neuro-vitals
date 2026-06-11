@@ -203,6 +203,8 @@ def analyze_video(
     - Truncate the runtime trace log to keep it fresh.
     - Delete any stray temporary video files left over from previous crashes.
     """
+    trace_log("[NeuroVitals] [ANALYZE] Starting new analysis request")
+    """
     # ---- Cleanup old runtime artifacts ----
     # Reset the trace log (if it exists)
     try:
@@ -230,7 +232,7 @@ def analyze_video(
                 trace_log(f"[NeuroVitals] [CLEANUP] Failed to delete temp file {fname}: {e}")
     # Continue with the normal request handling below
 
-    """Accept a short video, run the full rPPG → Bayesian → SHAP pipeline.
+    ""Accept a short video, run the full rPPG → Bayesian → SHAP pipeline.
     
     Using 'def' instead of 'async def' to offload this CPU-bound work
     to FastAPI's internal threadpool, preventing event loop blockage.
